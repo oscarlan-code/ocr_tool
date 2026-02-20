@@ -1,0 +1,5 @@
+# Optional advanced layout/table OCR dependencies
+# Install only if you want layout detection and Paddle table OCR
+layoutparser==0.3.4
+paddleocr==2.8.1
+# Install a paddlepaddle build appropriate for your OS from official docs

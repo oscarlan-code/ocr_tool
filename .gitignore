@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+*_media/
+*_figure_table.json
+*_figure_table.txt
+*_clean.txt
+*_llm_clean.txt
+quality_report.txt
