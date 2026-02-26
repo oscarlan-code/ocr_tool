@@ -105,6 +105,7 @@ DEFAULT_AUTO_MEDIA_SCAN = True
 DEFAULT_MEDIA_AREA_RATIO = "0.12"
 DEFAULT_MEDIA_SCAN_DPI = "120"
 DEFAULT_PREVIEW_MEDIA = True
+DEFAULT_PREFER_TEXT_LAYER = True
 
 VOCAB = [
     "점검", "보수", "유압", "윤활", "냉각", "주축", "이송축", "설정",
@@ -593,16 +594,25 @@ def _build_table_prompt(text, context_text=""):
     )
 
 
-def _build_figure_prompt(text, context_text=""):
+def _build_figure_prompt(text, context_text="", title=""):
     trimmed = _truncate_text(text, max_chars=2000)
     context = _truncate_text(context_text or "", max_chars=1200)
-    if not trimmed and not context:
+    title = (title or "").strip()
+    if not trimmed and not context and not title:
         return ""
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+    if trimmed:
+        parts.append(f"OCR text (from figure):\n{trimmed}")
+    if context:
+        parts.append(f"Context (nearby text):\n{context}")
+    body = "\n\n".join(parts)
     return (
-        "Describe the figure based only on the following OCR text labels or captions. "
-        "If there is not enough information, say 'Figure description unavailable from OCR text.'\n\n"
-        f"OCR text:\n{trimmed}\n\n"
-        f"Context:\n{context}" if context else f"OCR text:\n{trimmed}"
+        "Describe the figure by combining the OCR text extracted from the figure "
+        "and the nearby context. Focus on what the figure likely shows and any "
+        "key labels or steps. If details are insufficient, say 'Insufficient figure detail.'\n\n"
+        f"{body}"
     )
 
 
@@ -1408,7 +1418,9 @@ def ocr_pdf_pages(
                             deepseek_calls += 1
                         item["summary"] = summary
                 elif item["type"] == "figure" and summarize_figures:
-                    prompt = _build_figure_prompt(item["ocr_text"], context_text=context)
+                    prompt = _build_figure_prompt(
+                        item["ocr_text"], context_text=context, title=item.get("title", "")
+                    )
                     if prompt:
                         summary, err = deepseek_summarize(
                             prompt, deepseek_key, deepseek_base, deepseek_model
@@ -1487,6 +1499,7 @@ class App(tk.Tk):
         self.retry_low_conf_var = tk.BooleanVar(value=True)
         self.fallback_var = tk.BooleanVar(value=True)
         self.fast_mode_var = tk.BooleanVar(value=False)
+        self.prefer_text_layer_var = tk.BooleanVar(value=DEFAULT_PREFER_TEXT_LAYER)
 
         self.auto_lang_var = tk.BooleanVar(value=True)
         self.hangul_ratio_var = tk.StringVar(value=DEFAULT_HANGUL_RATIO)
@@ -1546,6 +1559,7 @@ class App(tk.Tk):
         ttk.Radiobutton(opts, text="OCR only", variable=self.ocr_mode, value="ocr").grid(row=0, column=2, sticky="w")
         ttk.Radiobutton(opts, text="Text only", variable=self.ocr_mode, value="text").grid(row=0, column=3, sticky="w")
         ttk.Checkbutton(opts, text="Fast mode (speed)", variable=self.fast_mode_var).grid(row=0, column=4, sticky="w")
+        ttk.Checkbutton(opts, text="Prefer text layer for main text", variable=self.prefer_text_layer_var).grid(row=0, column=5, sticky="w", padx=8)
 
         ttk.Label(opts, text="Language (Tesseract):").grid(row=1, column=0, sticky="w", padx=8, pady=6)
         ttk.Entry(opts, textvariable=self.lang_var, width=20).grid(row=1, column=1, sticky="w")
@@ -1931,6 +1945,7 @@ class App(tk.Tk):
             toc_min_keep = _safe_int(DEFAULT_TOC_MIN_KEEP, 8)
 
             fast_mode = self.fast_mode_var.get()
+            prefer_text_layer = self.prefer_text_layer_var.get()
             clean_output = self.clean_output_var.get()
             llm_clean = self.llm_clean_var.get()
             llm_skip_tables = self.llm_skip_tables_var.get()
@@ -2029,6 +2044,8 @@ class App(tk.Tk):
                 self._qstatus(f"File {idx}/{total_files}")
 
                 pages = []
+                text_layer_pages = []
+                text_layer = ""
                 page_confs = []
                 page_lows = []
                 page_retries = []
@@ -2043,12 +2060,16 @@ class App(tk.Tk):
                 deepseek_calls = 0
                 deepseek_errors = 0
 
-                if ocr_mode in ("auto", "text"):
+                if prefer_text_layer or ocr_mode in ("auto", "text"):
                     def on_page_text(cur, total):
                         self._qprogress_pages(cur, total)
-                    pages = extract_text_pdf_pages(pdf_path, on_page=on_page_text)
+                    text_layer_pages = extract_text_pdf_pages(pdf_path, on_page=on_page_text)
+                    text_layer = "\n\n".join(text_layer_pages).strip()
 
-                text = "\n\n".join(pages).strip()
+                if ocr_mode in ("auto", "text"):
+                    pages = text_layer_pages
+
+                text = text_layer if text_layer else "\n\n".join(pages).strip()
 
                 if ocr_mode == "ocr" or (ocr_mode == "auto" and len(text) < TEXT_MIN_CHARS):
                     if ocr_mode == "auto":
@@ -2111,6 +2132,9 @@ class App(tk.Tk):
                         on_page=on_page_ocr,
                     )
                     text = "\n\n".join(pages).strip()
+                    if prefer_text_layer and len(text_layer) >= TEXT_MIN_CHARS:
+                        text = text_layer
+                        self._qlog("Text layer detected; using it for main text output.")
                 elif ocr_mode == "auto" and len(text) >= TEXT_MIN_CHARS and auto_media_scan:
                     if not use_layout:
                         self._qlog("Auto media scan skipped: layout detection is off.")
