@@ -6,10 +6,27 @@ import re
 import threading
 import traceback
 import subprocess
-import tkinter as tk
+import tempfile
 from shutil import which
 from dataclasses import dataclass
-from tkinter import filedialog, messagebox, ttk
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    _TK_AVAILABLE = True
+except Exception:
+    # Keep OCR helpers importable in headless/runtime containers where tkinter
+    # shared libraries are not installed.
+    _TK_AVAILABLE = False
+
+    class _TkHeadlessShim:  # pragma: no cover - UI fallback shim
+        class Tk:
+            pass
+
+    tk = _TkHeadlessShim()
+    filedialog = None
+    messagebox = None
+    ttk = None
 
 try:
     import pdfplumber
@@ -60,6 +77,11 @@ try:
     import layoutparser as lp
 except Exception:
     lp = None
+
+try:
+    import deepdoctection as dd
+except Exception:
+    dd = None
 
 try:
     from PIL import Image, ImageTk
@@ -128,7 +150,192 @@ class Block:
 
 _LAYOUT_ENGINE = None
 _LAYOUT_ENGINE_KIND = None
+_LAYOUT_ENGINE_CACHE = {}
 _TABLE_OCR_ENGINE = None
+
+LAYOUT_BACKEND_CHOICES = ("auto", "paddle", "layoutparser", "deepdoctection")
+
+
+def normalize_layout_backend(value):
+    candidate = str(value or os.environ.get("OCR_LAYOUT_BACKEND", "auto")).strip().lower()
+    if not candidate or candidate in {"default", "preferred"}:
+        return "auto"
+    if candidate not in LAYOUT_BACKEND_CHOICES:
+        return "auto"
+    return candidate
+
+
+def get_layout_backend_availability():
+    return {
+        "paddle": PPStructure is not None,
+        "layoutparser": lp is not None,
+        "deepdoctection": dd is not None,
+    }
+
+
+def _load_paddle_layout_engine():
+    if PPStructure is None:
+        return None, None
+    try:
+        return PPStructure(show_log=False), "paddle"
+    except Exception:
+        return None, None
+
+
+def _load_layoutparser_layout_engine():
+    if lp is None:
+        return None, None
+    try:
+        model = lp.Detectron2LayoutModel(
+            "lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config",
+            extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.8],
+        )
+        return model, "layoutparser"
+    except Exception:
+        return None, None
+
+
+def _load_deepdoctection_layout_engine():
+    if dd is None:
+        return None, None
+    try:
+        if hasattr(dd, "get_dd_analyzer"):
+            os.environ.setdefault("DD_USE_TORCH", "1")
+            analyzer = dd.get_dd_analyzer(
+                config_overwrite=[
+                    "USE_OCR=False",
+                    "USE_TABLE_SEGMENTATION=False",
+                    "USE_LAYOUT_LINK=False",
+                    "USE_PDF_MINER=False",
+                    "USE_ROTATOR=False",
+                ]
+            )
+            return analyzer, "deepdoctection"
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _load_layout_engine_for_backend(backend):
+    if backend == "paddle":
+        return _load_paddle_layout_engine()
+    if backend == "layoutparser":
+        return _load_layoutparser_layout_engine()
+    if backend == "deepdoctection":
+        return _load_deepdoctection_layout_engine()
+    return None, None
+
+
+def _get_cached_layout_engine(backend):
+    cache_key = normalize_layout_backend(backend)
+    if cache_key in _LAYOUT_ENGINE_CACHE:
+        return _LAYOUT_ENGINE_CACHE[cache_key]
+    engine_info = _load_layout_engine_for_backend(cache_key)
+    _LAYOUT_ENGINE_CACHE[cache_key] = engine_info
+    return engine_info
+
+
+def _layout_backend_order(preferred_backend):
+    normalized = normalize_layout_backend(preferred_backend)
+    if normalized != "auto":
+        return [normalized]
+    # Preserve the current default path; deepdoctection is opt-in for benchmarking.
+    return ["paddle", "layoutparser"]
+
+
+def _deepdoctection_page_result(result):
+    if result is None:
+        return None
+    if hasattr(result, "layouts") or hasattr(result, "annotations"):
+        return result
+    if hasattr(result, "reset_state"):
+        try:
+            result.reset_state()
+            iterator = iter(result)
+            return next(iterator)
+        except Exception:
+            return None
+    if hasattr(result, "pages"):
+        pages = getattr(result, "pages")
+        if pages:
+            return pages[0]
+    if isinstance(result, (list, tuple)) and result:
+        return result[0]
+    try:
+        iterator = iter(result)
+    except TypeError:
+        return None
+    try:
+        return next(iterator)
+    except StopIteration:
+        return None
+    except Exception:
+        return None
+
+
+def _deepdoctection_annotations(page):
+    if page is None:
+        return []
+    getter = getattr(page, "get_annotation", None)
+    if callable(getter):
+        try:
+            value = getter()
+            if value:
+                return list(value)
+        except Exception:
+            return []
+    for attr in ("layouts", "annotations"):
+        value = getattr(page, attr, None)
+        if value:
+            return list(value)
+    return []
+
+
+def _annotation_bbox(annotation):
+    box = getattr(annotation, "bbox", None)
+    if box is None and isinstance(annotation, dict):
+        box = annotation.get("bbox")
+    if box is None and hasattr(annotation, "bounding_box"):
+        box = getattr(annotation, "bounding_box")
+    if box is None:
+        return None
+    if hasattr(box, "ulx") and hasattr(box, "uly") and hasattr(box, "lrx") and hasattr(box, "lry"):
+        return (
+            int(box.ulx),
+            int(box.uly),
+            int(box.lrx),
+            int(box.lry),
+        )
+    if isinstance(box, (list, tuple)) and len(box) == 4:
+        return tuple(int(value) for value in box)
+    return None
+
+
+def _annotation_category_name(annotation):
+    candidates = []
+    if isinstance(annotation, dict):
+        candidates.extend(
+            [
+                annotation.get("category_name"),
+                annotation.get("category"),
+                annotation.get("type"),
+                annotation.get("label"),
+            ]
+        )
+    for attr in ("category_name", "category_id", "category", "type", "label"):
+        try:
+            value = getattr(annotation, attr)
+        except BaseException:
+            value = None
+        if value is not None:
+            candidates.append(value)
+    for value in candidates:
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if text:
+            return text
+    return ""
 
 
 def _ensure_deps():
@@ -822,33 +1029,17 @@ def choose_preprocessed(gray, bw, mode, ink_ratio_threshold):
     return bw, "bw"
 
 
-def get_layout_engine():
+def get_layout_engine(preferred_backend=None):
     global _LAYOUT_ENGINE, _LAYOUT_ENGINE_KIND
-    if _LAYOUT_ENGINE is not None:
-        return _LAYOUT_ENGINE, _LAYOUT_ENGINE_KIND
-
-    if PPStructure is not None:
-        try:
-            _LAYOUT_ENGINE = PPStructure(show_log=False)
-            _LAYOUT_ENGINE_KIND = "paddle"
-            return _LAYOUT_ENGINE, _LAYOUT_ENGINE_KIND
-        except Exception:
-            _LAYOUT_ENGINE = None
-            _LAYOUT_ENGINE_KIND = None
-
-    if lp is not None:
-        try:
-            model = lp.Detectron2LayoutModel(
-                "lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config",
-                extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.8],
-            )
-            _LAYOUT_ENGINE = model
-            _LAYOUT_ENGINE_KIND = "layoutparser"
-        except Exception:
-            _LAYOUT_ENGINE = None
-            _LAYOUT_ENGINE_KIND = None
-
-    return _LAYOUT_ENGINE, _LAYOUT_ENGINE_KIND
+    for backend in _layout_backend_order(preferred_backend):
+        engine, kind = _get_cached_layout_engine(backend)
+        if engine is not None:
+            _LAYOUT_ENGINE = engine
+            _LAYOUT_ENGINE_KIND = kind
+            return engine, kind
+    _LAYOUT_ENGINE = None
+    _LAYOUT_ENGINE_KIND = None
+    return None, None
 
 
 def get_table_ocr_engine():
@@ -864,11 +1055,11 @@ def get_table_ocr_engine():
     return _TABLE_OCR_ENGINE
 
 
-def detect_layout_blocks(img_bgr):
-    engine, kind = get_layout_engine()
+def detect_layout_blocks_with_backend(img_bgr, preferred_backend=None):
+    engine, kind = get_layout_engine(preferred_backend=preferred_backend)
     h, w = img_bgr.shape[:2]
     if engine is None:
-        return [Block(kind="text", bbox=(0, 0, w, h))]
+        return [Block(kind="text", bbox=(0, 0, w, h))], "none"
 
     blocks = []
     if kind == "paddle":
@@ -903,11 +1094,55 @@ def detect_layout_blocks(img_bgr):
                 blocks.append(Block(kind=mapped, bbox=bbox))
         except Exception:
             blocks = [Block(kind="text", bbox=(0, 0, w, h))]
+    elif kind == "deepdoctection":
+        try:
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB) if cv2 is not None else img_bgr
+            analysis = None
+            analyze = getattr(engine, "analyze", None)
+            if callable(analyze):
+                image_bytes = None
+                if cv2 is not None:
+                    ok, encoded = cv2.imencode(".png", rgb)
+                    if ok:
+                        image_bytes = encoded.tobytes()
+                if image_bytes is None:
+                    raise RuntimeError("Unable to encode image for DeepDoctection")
+                temp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        tmp.write(image_bytes)
+                        temp_path = tmp.name
+                    analysis = analyze(path=temp_path, bytes=image_bytes)
+                finally:
+                    if temp_path:
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+            page = _deepdoctection_page_result(analysis)
+            for annotation in _deepdoctection_annotations(page):
+                bbox = _annotation_bbox(annotation)
+                if not bbox:
+                    continue
+                label = _annotation_category_name(annotation)
+                if "table" in label:
+                    mapped = "table"
+                elif any(token in label for token in ("figure", "graphic", "picture", "image")):
+                    mapped = "figure"
+                else:
+                    mapped = "text"
+                blocks.append(Block(kind=mapped, bbox=bbox))
+        except Exception:
+            blocks = [Block(kind="text", bbox=(0, 0, w, h))]
 
     if not blocks:
         blocks = [Block(kind="text", bbox=(0, 0, w, h))]
-
     blocks.sort(key=lambda b: (b.bbox[1], b.bbox[0]))
+    return blocks, kind or "none"
+
+
+def detect_layout_blocks(img_bgr, preferred_backend=None):
+    blocks, _ = detect_layout_blocks_with_backend(img_bgr, preferred_backend=preferred_backend)
     return blocks
 
 
@@ -2396,5 +2631,10 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    if not _TK_AVAILABLE:
+        raise RuntimeError(
+            "Tkinter UI is unavailable in this environment. "
+            "Use the batch/media extraction scripts for headless execution."
+        )
     app = App()
     app.mainloop()
